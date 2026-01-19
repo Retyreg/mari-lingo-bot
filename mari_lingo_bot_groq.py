@@ -30,6 +30,8 @@ load_dotenv()
 import sys
 sys.path.append('.')
 from rag_search import RAGSearcher
+from quiz_system import QuizGenerator, QuizSession
+from spaced_repetition import SpacedRepetitionSystem, FlashCard
 
 # Настройка логирования
 logging.basicConfig(
@@ -47,6 +49,9 @@ USER_DATA_PATH = "./user_data"
 # Инициализация клиентов
 groq_client = Groq(api_key=GROQ_API_KEY)
 rag_searcher = RAGSearcher(db_path=RAG_DB_PATH)
+
+# Инициализация генератора квизов
+quiz_generator = QuizGenerator(rag_searcher, groq_client)
 
 # Создание директории для данных пользователей
 Path(USER_DATA_PATH).mkdir(exist_ok=True)
@@ -114,10 +119,12 @@ class MariLingoBot:
         """Получение или создание сессии пользователя"""
         if user_id not in self.user_sessions:
             self.user_sessions[user_id] = {
-                "mode": "chat",  # chat, quiz, flashcard
+                "mode": "chat",  # chat, quiz, flashcard, sr_review
                 "quiz_state": None,
                 "flashcard_state": None,
-                "progress": UserProgress(user_id)
+                "sr_state": None,  # Состояние SR повторения
+                "progress": UserProgress(user_id),
+                "sr_system": SpacedRepetitionSystem(user_id, USER_DATA_PATH)  # SR система
             }
         return self.user_sessions[user_id]
     
@@ -356,6 +363,20 @@ class MariLingoBot:
         elif data == "mode_exercise":
             await self.start_exercise_mode(query, session)
         
+        # Обработчики квизов
+        elif data.startswith("quiz_"):
+            difficulty = data.replace("quiz_", "")
+            await self.start_quiz_session(query, session, difficulty)
+        
+        elif data.startswith("answer_"):
+            await self.handle_quiz_answer_callback(query, session, data)
+        
+        elif data == "quiz_next":
+            await self.show_next_quiz_question(query, session)
+        
+        elif data == "quiz_finish":
+            await self.finish_quiz(query, session)
+        
         elif data == "show_progress":
             progress = session["progress"]
             accuracy = progress.get_accuracy()
@@ -423,11 +444,229 @@ class MariLingoBot:
             logger.error(f"Ошибка в режиме карточек: {e}")
             await query.edit_message_text("Произошла ошибка. Попробуй позже!")
     
-    async def start_quiz_mode(self, query, session):
-        """Запуск режима теста"""
-        session["mode"] = "quiz"
+    async def start_quiz_session(self, query, session, difficulty: str):
+        """Начало новой сессии теста"""
+        try:
+            await query.edit_message_text(
+                "⏳ Генерирую вопросы...\n\nПодожди немного!",
+                parse_mode="Markdown"
+            )
+            
+            # Генерация вопросов
+            questions = quiz_generator.generate_quiz(num_questions=5, difficulty=difficulty)
+            
+            # Создание сессии квиза
+            quiz_session = QuizSession(query.from_user.id, questions)
+            session["quiz_state"] = quiz_session
+            
+            # Показываем первый вопрос
+            await self.show_quiz_question(query, session)
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания квиза: {e}")
+            await query.edit_message_text(
+                "Произошла ошибка при генерации теста. Попробуй еще раз!",
+                parse_mode="Markdown"
+            )
+    
+    async def show_quiz_question(self, query, session):
+        """Показать текущий вопрос"""
+        quiz_session = session.get("quiz_state")
+        
+        if not quiz_session or quiz_session.is_finished():
+            await self.finish_quiz(query, session)
+            return
+        
+        question = quiz_session.get_current_question()
+        
+        if not question:
+            await self.finish_quiz(query, session)
+            return
+        
+        # Формируем текст вопроса
+        progress = quiz_session.get_progress()
+        question_text = f"""
+📝 **Вопрос {progress}**
+
+{question['question']}
+
+Выберите правильный ответ:
+"""
+        
+        # Создаем кнопки с вариантами ответов
+        keyboard = []
+        for i, option in enumerate(question['options']):
+            # Используем эмодзи для обозначения вариантов
+            emoji = ['🅰️', '🅱️', '🅲', '🅳'][i]
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{emoji} {option}", 
+                    callback_data=f"answer_{i}_{option}"
+                )
+            ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await query.edit_message_text(
-            "🎯 **Режим теста активирован!**\n\n(Функция в разработке)\n\nПопробуй задать вопрос в режиме чата!",
+            question_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    
+    async def handle_quiz_answer_callback(self, query, session, callback_data: str):
+        """Обработка ответа на вопрос квиза"""
+        quiz_session = session.get("quiz_state")
+        
+        if not quiz_session:
+            await query.edit_message_text("Ошибка: сессия квиза не найдена")
+            return
+        
+        # Извлекаем ответ из callback_data
+        parts = callback_data.split("_", 2)
+        if len(parts) < 3:
+            return
+        
+        user_answer = parts[2]
+        
+        # Отправляем ответ
+        result = quiz_session.submit_answer(user_answer)
+        
+        # Формируем сообщение с результатом
+        if result['correct']:
+            result_emoji = "✅"
+            result_text = "**Правильно!**"
+        else:
+            result_emoji = "❌"
+            result_text = f"**Неправильно!**\n\nПравильный ответ: **{result['correct_answer']}**"
+        
+        feedback_text = f"""
+{result_emoji} {result_text}
+
+💡 {result['explanation']}
+
+📊 Счет: {result['score']}/{result['total']}
+"""
+        
+        # Обновляем прогресс пользователя
+        progress = session["progress"]
+        progress.add_question(result['correct'])
+        
+        # Кнопка для следующего вопроса или завершения
+        if quiz_session.is_finished():
+            keyboard = [[InlineKeyboardButton("📊 Показать результаты", callback_data="quiz_finish")]]
+        else:
+            keyboard = [[InlineKeyboardButton("➡️ Следующий вопрос", callback_data="quiz_next")]]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            feedback_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    
+    async def show_next_quiz_question(self, query, session):
+        """Показать следующий вопрос"""
+        await self.show_quiz_question(query, session)
+    
+    async def finish_quiz(self, query, session):
+        """Завершение квиза и показ результатов"""
+        quiz_session = session.get("quiz_state")
+        
+        if not quiz_session:
+            await query.edit_message_text("Ошибка: сессия квиза не найдена")
+            return
+        
+        # Получаем итоговые результаты
+        results = quiz_session.get_final_results()
+        
+        # Сохраняем в историю пользователя
+        progress = session["progress"]
+        progress.data['quiz_history'].append(results)
+        progress.save()
+        
+        # Формируем итоговое сообщение
+        percentage = results['percentage']
+        
+        # Выбираем эмодзи в зависимости от результата
+        if percentage >= 90:
+            emoji = "🌟"
+        elif percentage >= 70:
+            emoji = "👍"
+        elif percentage >= 50:
+            emoji = "💪"
+        else:
+            emoji = "📚"
+        
+        results_text = f"""
+{emoji} **Тест завершен!**
+
+📊 **Ваши результаты:**
+
+✅ Правильных ответов: {results['score']}/{results['total']}
+📈 Процент: {percentage:.1f}%
+⏱ Время: {results['duration_seconds']} сек
+
+{results['level']}
+
+{'🏆 Отличная работа! Продолжай в том же духе!' if percentage >= 80 else '💪 Хорошая попытка! Продолжай практиковаться!'}
+"""
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Пройти еще раз", callback_data="mode_quiz"),
+                InlineKeyboardButton("📊 Мой прогресс", callback_data="show_progress")
+            ],
+            [
+                InlineKeyboardButton("🏠 Главное меню", callback_data="mode_chat")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            results_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+        
+        # Очищаем состояние квиза
+        session["quiz_state"] = None
+        session["mode"] = "chat"
+    
+    async def start_quiz_mode(self, query, session):
+        """Запуск режима теста - выбор сложности"""
+        session["mode"] = "quiz"
+        
+        quiz_text = """
+🎯 **Режим теста**
+
+Выберите уровень сложности:
+
+📗 **Легкий** - базовые слова и фразы
+📘 **Средний** - обычная лексика и грамматика
+📕 **Сложный** - продвинутые темы
+
+Каждый тест содержит 5 вопросов.
+За каждый правильный ответ - 1 балл! 🌟
+"""
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("📗 Легкий", callback_data="quiz_easy"),
+                InlineKeyboardButton("📘 Средний", callback_data="quiz_medium"),
+            ],
+            [
+                InlineKeyboardButton("📕 Сложный", callback_data="quiz_hard"),
+            ],
+            [
+                InlineKeyboardButton("🏠 Главное меню", callback_data="mode_chat")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            quiz_text,
+            reply_markup=reply_markup,
             parse_mode="Markdown"
         )
     
