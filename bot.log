@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/Users/dmitrijvatutov/Desktop/1AI/Projects/Mari Lingo/Bot/mari_lingo_bot.py", line 28, in <module>
+    from rag_search import RAGSearcher
+ModuleNotFoundError: No module named 'rag_search'

@@ -1,0 +1,66 @@
+# Mari Lingo Bot - Git Ignore
+
+# Переменные окружения и секреты
+.env
+.env.local
+.env.*.local
+
+# Данные пользователей
+user_data/
+*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# RAG Database (опционально, если большая)
+# rag_database/
+
+# Логи
+*.log
+bot.log
+nohup.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Временные файлы
+temp/
+tmp/
+*.tmp
+
+# Тестовые данные
+test_data/
+*.test
+
+# Бэкапы
+*.bak
+backup/
