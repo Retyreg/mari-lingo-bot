@@ -33,6 +33,7 @@ from rag_search import RAGSearcher
 from quiz_system import QuizGenerator, QuizSession
 from spaced_repetition import SpacedRepetitionSystem, FlashCard
 from gamification import GamificationSystem, LEVELS, get_leaderboard, format_leaderboard
+from flashcard_system import FlashcardDeck, FlashcardManager, FlashCard as FC, format_flashcard_message, format_session_stats
 
 # Настройка логирования
 logging.basicConfig(
@@ -133,7 +134,9 @@ class MariLingoBot:
                 "sr_state": None,
                 "progress": UserProgress(user_id),
                 "sr_system": SpacedRepetitionSystem(user_id, USER_DATA_PATH),
-                "gamification": GamificationSystem(user_id, USER_DATA_PATH)
+                "gamification": GamificationSystem(user_id, USER_DATA_PATH),
+                "flashcard_deck": None,
+                "flashcard_session": {"knew": 0, "total": 0}
             }
         return self.user_sessions[user_id]
     
@@ -446,6 +449,35 @@ class MariLingoBot:
         elif data == "mode_flashcard":
             await self.start_flashcard_mode(query, session)
         
+        # Карточки - обработчики
+        elif data == "fc_review":
+            await self.start_flashcard_session(query, session, mode="review")
+        
+        elif data == "fc_new":
+            await self.start_flashcard_session(query, session, mode="new")
+        
+        elif data == "fc_categories":
+            await self.show_flashcard_categories(query, session)
+        
+        elif data.startswith("fc_cat_"):
+            category = data.replace("fc_cat_", "")
+            await self.start_flashcard_session(query, session, mode="mixed", category=category)
+        
+        elif data == "fc_start":
+            await self.start_flashcard_session(query, session, mode="mixed")
+        
+        elif data == "fc_show":
+            await self.show_flashcard_answer(query, session)
+        
+        elif data == "fc_yes":
+            await self.handle_flashcard_answer(query, session, knew=True)
+        
+        elif data == "fc_no":
+            await self.handle_flashcard_answer(query, session, knew=False)
+        
+        elif data == "fc_stats":
+            await self.show_flashcard_stats(query, session)
+        
         elif data == "mode_quiz":
             await self.start_quiz_mode(query, session)
         
@@ -530,65 +562,241 @@ class MariLingoBot:
             await self.show_main_menu_query(query)
     
     async def start_flashcard_mode(self, query, session):
-        """Запуск режима карточек"""
+        """Запуск режима карточек - главное меню"""
         session["mode"] = "flashcard"
-        gamification = session["gamification"]
+        gamification = session.get("gamification")
         
-        try:
-            import io
-            import contextlib
-            
-            f = io.StringIO()
-            with contextlib.redirect_stdout(f):
-                rag_results = rag_searcher.search("марийское слово перевод", n_results=1)
-            
-            if rag_results and rag_results['documents'][0]:
-                context = rag_results['documents'][0][0][:300]
-                
-                chat_completion = groq_client.chat.completions.create(
-                    messages=[{
-                        "role": "user",
-                        "content": f"Из этого текста найди марийское слово и его перевод на русский. Ответь кратко в формате: Слово | Перевод\n\n{context}"
-                    }],
-                    model="llama-3.3-70b-versatile",
-                    temperature=0.3,
-                    max_tokens=100,
-                )
-                
-                flashcard_text = chat_completion.choices[0].message.content
-                
-                # Записываем в геймификацию
-                game_result = gamification.record_flashcard_learned(flashcard_text)
-                
-                card_message = f"🎴 **Карточка**\n\n{flashcard_text}\n\n⭐ +{game_result['xp_earned']} XP"
-                
-                if game_result['level_up']:
-                    new_level = gamification.data['level']
-                    level_info = LEVELS[new_level]
-                    card_message += f"\n\n🎉 **Новый уровень!** {level_info['emoji']} {level_info['name']}"
-                
-                if game_result['new_achievements']:
-                    for ach in game_result['new_achievements']:
-                        card_message += f"\n🏆 {ach['emoji']} {ach['name']}"
-                
-                keyboard = [
-                    [InlineKeyboardButton("🔄 Следующее слово", callback_data="mode_flashcard")],
-                    [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    card_message,
-                    reply_markup=reply_markup,
-                    parse_mode="Markdown"
-                )
-            else:
-                await query.edit_message_text("Не удалось найти слово. Попробуй позже!")
-                
-        except Exception as e:
-            logger.error(f"Ошибка в режиме карточек: {e}")
-            await query.edit_message_text("Произошла ошибка. Попробуй позже!")
+        # Инициализируем колоду если нет
+        if not session.get("flashcard_deck"):
+            deck = FlashcardDeck(query.from_user.id, USER_DATA_PATH)
+            session["flashcard_deck"] = deck
+        else:
+            deck = session["flashcard_deck"]
+        
+        # Инициализируем колоду базовым словарём если пустая
+        if len(deck.cards) == 0:
+            added = FlashcardManager.initialize_deck(deck)
+            init_msg = "\n\n✨ Добавлено " + str(added) + " слов!"
+        else:
+            init_msg = ""
+        
+        stats = deck.get_stats()
+        
+        text = f"""
+🎴 **Карточки**
+
+📊 **Твоя колода:**
+📖 Всего: {stats['total']}
+🆕 Новых: {stats['new']}
+📗 Изучаю: {stats['learning']}
+⭐ Выучено: {stats['mastered']}
+📆 Повторить: {stats['due_today']}{init_msg}
+
+Выбери режим:
+"""
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Повторение", callback_data="fc_review"),
+                InlineKeyboardButton("🆕 Новые", callback_data="fc_new")
+            ],
+            [
+                InlineKeyboardButton("📚 Категории", callback_data="fc_categories")
+            ],
+            [
+                InlineKeyboardButton("📊 Статистика", callback_data="fc_stats"),
+                InlineKeyboardButton("🏠 Меню", callback_data="mode_chat")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     
+    async def show_flashcard_categories(self, query, session):
+        """Показать категории"""
+        categories = FlashcardManager.get_categories()
+        
+        emoji_map = {
+            "приветствия": "👋", "семья": "👨‍👩‍👧", "природа": "🌿",
+            "еда": "🍞", "дом": "🏠", "цвета": "🎨",
+            "животные": "🐾", "числа": "🔢", "глаголы": "🏃"
+        }
+        
+        text = "📚 **Выбери категорию:**"
+        
+        keyboard = []
+        row = []
+        for cat in categories:
+            emoji = emoji_map.get(cat, "📖")
+            row.append(InlineKeyboardButton(f"{emoji} {cat.title()}", callback_data=f"fc_cat_{cat}"))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="mode_flashcard")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    async def start_flashcard_session(self, query, session, mode: str = "mixed", category: str = None):
+        """Начать сессию карточек"""
+        deck = session.get("flashcard_deck")
+        if not deck:
+            deck = FlashcardDeck(query.from_user.id, USER_DATA_PATH)
+            session["flashcard_deck"] = deck
+        
+        # Добавляем слова из категории если указана
+        if category:
+            words = FlashcardManager.get_words_by_category(category)
+            for w in words:
+                card = FC(
+                    word_mari=w["mari"], word_russian=w["russian"],
+                    example_mari=w.get("example_mari", ""),
+                    example_russian=w.get("example_russian", ""),
+                    category=w.get("category", ""), difficulty=w.get("difficulty", "easy")
+                )
+                deck.add_card(card)
+        
+        # Запускаем сессию
+        card = deck.start_session(mode=mode, limit=10)
+        
+        if not card:
+            text = "📭 Нет карточек!\n\n"
+            if mode == "review":
+                text += "Все слова повторены, приходи позже!"
+            else:
+                text += "Добавь новые слова через категории."
+            
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="mode_flashcard")]])
+            )
+            return
+        
+        session["flashcard_session"] = {"knew": 0, "total": len(deck.current_session)}
+        await self.show_flashcard(query, session, card, show_answer=False)
+    
+    async def show_flashcard(self, query, session, card, show_answer: bool = False):
+        """Показать карточку"""
+        deck = session["flashcard_deck"]
+        progress = f"📍 {deck.session_index + 1}/{len(deck.current_session)}"
+        
+        text = format_flashcard_message(card, show_answer)
+        text = progress + "\n" + text
+        
+        if not show_answer:
+            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data="fc_show")]]
+        else:
+            keyboard = [[
+                InlineKeyboardButton("❌ Не знал", callback_data="fc_no"),
+                InlineKeyboardButton("✅ Знал", callback_data="fc_yes")
+            ]]
+        
+        keyboard.append([InlineKeyboardButton("🏠 Выйти", callback_data="mode_flashcard")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    async def show_flashcard_answer(self, query, session):
+        """Показать ответ"""
+        deck = session.get("flashcard_deck")
+        card = deck.get_current_card() if deck else None
+        
+        if card:
+            await self.show_flashcard(query, session, card, show_answer=True)
+        else:
+            await self.finish_flashcard_session(query, session)
+    
+    async def handle_flashcard_answer(self, query, session, knew: bool):
+        """Обработка ответа"""
+        deck = session.get("flashcard_deck")
+        gamification = session.get("gamification")
+        
+        deck.answer_current(knew)
+        
+        if knew:
+            session["flashcard_session"]["knew"] += 1
+            if gamification:
+                gamification.add_xp(5, "flashcard_correct")
+        
+        if deck.is_session_finished():
+            await self.finish_flashcard_session(query, session)
+        else:
+            card = deck.get_current_card()
+            if card:
+                await self.show_flashcard(query, session, card, show_answer=False)
+            else:
+                await self.finish_flashcard_session(query, session)
+    
+    async def finish_flashcard_session(self, query, session):
+        """Завершение сессии"""
+        deck = session.get("flashcard_deck")
+        gamification = session.get("gamification")
+        
+        knew = session.get("flashcard_session", {}).get("knew", 0)
+        total = session.get("flashcard_session", {}).get("total", 0)
+        
+        if gamification and total > 0:
+            gamification.add_xp(20, "flashcard_session")
+            gamification.update_daily_goal("flashcards", total)
+            if knew == total and total >= 5:
+                gamification.check_achievement("perfect_recall")
+        
+        text = format_session_stats(deck, knew, total)
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Ещё", callback_data="fc_start"),
+                InlineKeyboardButton("📊 Статистика", callback_data="fc_stats")
+            ],
+            [InlineKeyboardButton("🏠 Меню", callback_data="mode_flashcard")]
+        ]
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    async def show_flashcard_stats(self, query, session):
+        """Статистика карточек"""
+        deck = session.get("flashcard_deck")
+        if not deck:
+            deck = FlashcardDeck(query.from_user.id, USER_DATA_PATH)
+            session["flashcard_deck"] = deck
+        
+        stats = deck.get_stats()
+        
+        categories_count = {}
+        for card in deck.cards.values():
+            cat = card.category
+            if cat not in categories_count:
+                categories_count[cat] = {"total": 0, "mastered": 0}
+            categories_count[cat]["total"] += 1
+            if card.repetitions >= 5:
+                categories_count[cat]["mastered"] += 1
+        
+        text = f"""
+📊 **Статистика карточек**
+
+📖 Всего: {stats['total']}
+🆕 Новых: {stats['new']}
+📗 Изучаю: {stats['learning']}
+⭐ Выучено: {stats['mastered']}
+📆 К повторению: {stats['due_today']}
+
+📂 **По категориям:**
+"""
+        
+        emoji_map = {"приветствия": "👋", "семья": "👨‍👩‍👧", "природа": "🌿",
+                     "еда": "🍞", "дом": "🏠", "цвета": "🎨",
+                     "животные": "🐾", "числа": "🔢", "глаголы": "🏃"}
+        
+        for cat, c in sorted(categories_count.items()):
+            emoji = emoji_map.get(cat, "📖")
+            text += emoji + " " + cat + ": " + str(c["mastered"]) + "/" + str(c["total"]) + "\n"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="mode_flashcard")]]
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
     async def start_quiz_session(self, query, session, difficulty: str):
         """Начало новой сессии теста"""
         try:

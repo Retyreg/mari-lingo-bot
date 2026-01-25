@@ -64,3 +64,7 @@ test_data/
 # Бэкапы
 *.bak
 backup/
+rag_database/
+rag_database_broken/
+PDF/
+*.sqlite3
