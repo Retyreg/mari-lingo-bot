@@ -1,13 +1,14 @@
 """
 Quiz System - Система тестов и викторин для Mari Lingo Bot
-Автоматическая генерация вопросов из RAG базы
+Улучшенная версия с валидацией
 """
 
 import json
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from datetime import datetime
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -21,22 +22,11 @@ class QuizGenerator:
         self.question_types = [
             "translation_to_russian",
             "translation_to_mari",
-            "multiple_choice",
-            "fill_blank",
-            "grammar"
         ]
+        self.used_words = set()  # Для избежания повторов
     
     def generate_question(self, difficulty: str = "medium", question_type: str = None) -> Dict:
-        """
-        Генерация одного вопроса
-        
-        Args:
-            difficulty: easy, medium, hard
-            question_type: тип вопроса или None для случайного
-            
-        Returns:
-            Dict с вопросом, вариантами ответов и правильным ответом
-        """
+        """Генерация одного вопроса"""
         if question_type is None:
             question_type = random.choice(self.question_types)
         
@@ -45,20 +35,14 @@ class QuizGenerator:
                 return self._generate_translation_question(to_russian=True, difficulty=difficulty)
             elif question_type == "translation_to_mari":
                 return self._generate_translation_question(to_russian=False, difficulty=difficulty)
-            elif question_type == "multiple_choice":
-                return self._generate_multiple_choice_question(difficulty=difficulty)
-            elif question_type == "fill_blank":
-                return self._generate_fill_blank_question(difficulty=difficulty)
-            elif question_type == "grammar":
-                return self._generate_grammar_question(difficulty=difficulty)
             else:
-                return self._generate_multiple_choice_question(difficulty=difficulty)
+                return self._generate_translation_question(to_russian=True, difficulty=difficulty)
         except Exception as e:
             logger.error(f"Ошибка генерации вопроса: {e}")
             return self._generate_fallback_question()
     
-    def _get_rag_context(self, query: str, n_results: int = 2) -> str:
-        """Получение контекста из RAG базы без вывода в консоль"""
+    def _get_rag_context(self, query: str, n_results: int = 3) -> str:
+        """Получение контекста из RAG базы"""
         import io
         import contextlib
         
@@ -67,60 +51,92 @@ class QuizGenerator:
             results = self.rag_searcher.search(query, n_results=n_results)
         
         if results and results.get('documents') and results['documents'][0]:
-            return results['documents'][0][0][:1000]
+            # Объединяем несколько результатов для разнообразия
+            texts = []
+            for doc in results['documents'][0]:
+                texts.append(doc[:800])
+            return "\n---\n".join(texts)
         return ""
     
     def _generate_translation_question(self, to_russian: bool, difficulty: str) -> Dict:
-        """Генерация вопроса на перевод"""
+        """Генерация вопроса на перевод слов"""
         
-        # Получаем контекст с марийскими словами
-        context = self._get_rag_context("марийские слова перевод")
+        # Разные запросы для разнообразия
+        queries = [
+            "марийский словарь слова перевод",
+            "марийские существительные",
+            "марийские глаголы",
+            "марийские прилагательные",
+            "базовые марийские слова"
+        ]
+        context = self._get_rag_context(random.choice(queries))
         
         if not context:
             return self._generate_fallback_question()
         
-        prompt = f"""На основе этого текста о марийском языке, создай вопрос на перевод.
+        if to_russian:
+            prompt = f"""Из этого словаря выбери ОДНО марийское слово и создай вопрос на перевод.
 
-Текст: {context}
+Словарь:
+{context}
 
-Создай вопрос уровня {difficulty}:
-- easy: простые базовые слова (привет, спасибо, да, нет)
-- medium: обычные слова (семья, дом, еда)
-- hard: сложные слова и выражения
+ЗАДАЧА: Создай вопрос "Как переводится марийское слово X?" где X - марийское слово.
+Все 4 варианта ответа должны быть на РУССКОМ языке.
 
-Формат ответа (строго JSON):
-{{
-    "question": "{'Как переводится на русский' if to_russian else 'Как переводится на марийский'}: [слово]?",
-    "correct_answer": "[правильный ответ]",
-    "options": ["[вариант 1]", "[вариант 2]", "[вариант 3]", "[вариант 4]"],
-    "explanation": "[краткое объяснение]"
-}}
+Верни ТОЛЬКО JSON:
+{{"question": "Как переводится марийское слово [марийское]?", "correct_answer": "[русский перевод]", "options": ["[русский1]", "[русский2]", "[русский3]", "[русский4]"], "explanation": "[марийское] = [русское]"}}
 
-ВАЖНО: 
-- Используй только слова из предоставленного текста
-- Все 4 варианта должны быть правдоподобными
-- Правильный ответ должен быть среди options
-- Ответ ТОЛЬКО в формате JSON, без дополнительного текста"""
+Пример правильного ответа:
+{{"question": "Как переводится марийское слово шӱкаш?", "correct_answer": "толкать", "options": ["толкать", "бежать", "идти", "стоять"], "explanation": "шӱкаш = толкать"}}"""
+
+        else:
+            prompt = f"""Из этого словаря выбери ОДНО русское слово и создай вопрос на перевод.
+
+Словарь:
+{context}
+
+ЗАДАЧА: Создай вопрос "Как сказать X на марийском?" где X - русское слово.
+Все 4 варианта ответа должны быть на МАРИЙСКОМ языке (с буквами ӱ, ӧ, ӓ, ӹ если нужно).
+
+Верни ТОЛЬКО JSON:
+{{"question": "Как сказать [русское] на марийском?", "correct_answer": "[марийский перевод]", "options": ["[марийский1]", "[марийский2]", "[марийский3]", "[марийский4]"], "explanation": "[русское] = [марийское]"}}
+
+Пример правильного ответа:
+{{"question": "Как сказать толкать на марийском?", "correct_answer": "шӱкаш", "options": ["шӱкаш", "кошташ", "ошкылаш", "шогаш"], "explanation": "толкать = шӱкаш"}}"""
 
         try:
             response = self.groq_client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model="llama-3.3-70b-versatile",
-                temperature=0.7,
-                max_tokens=500,
+                temperature=0.8,
+                max_tokens=400,
             )
             
             content = response.choices[0].message.content.strip()
             
-            # Удаляем markdown форматирование если есть
-            if content.startswith("```json"):
-                content = content.replace("```json", "").replace("```", "").strip()
-            elif content.startswith("```"):
-                content = content.replace("```", "").strip()
+            # Очищаем от markdown
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            # Находим JSON в ответе
+            json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
+            if json_match:
+                content = json_match.group()
             
             question_data = json.loads(content)
             
-            # Перемешиваем варианты ответов
+            # Валидация
+            if not self._validate_question(question_data, to_russian):
+                logger.warning("Вопрос не прошёл валидацию, используем fallback")
+                return self._generate_fallback_question()
+            
+            # Добавляем слово в использованные
+            word = question_data["correct_answer"]
+            self.used_words.add(word.lower())
+            
+            # Перемешиваем варианты
             random.shuffle(question_data["options"])
             
             question_data["type"] = "translation"
@@ -132,207 +148,193 @@ class QuizGenerator:
             logger.error(f"Ошибка парсинга вопроса: {e}")
             return self._generate_fallback_question()
     
-    def _generate_multiple_choice_question(self, difficulty: str) -> Dict:
-        """Генерация вопроса с множественным выбором"""
-        
-        context = self._get_rag_context("марийский язык грамматика культура")
-        
-        if not context:
-            return self._generate_fallback_question()
-        
-        prompt = f"""На основе этого текста о марийском языке, создай вопрос с множественным выбором.
-
-Текст: {context}
-
-Уровень: {difficulty}
-- easy: базовые факты
-- medium: средняя сложность
-- hard: детальные знания
-
-Формат ответа (строго JSON):
-{{
-    "question": "[вопрос о марийском языке или культуре]",
-    "correct_answer": "[правильный ответ]",
-    "options": ["[вариант 1]", "[вариант 2]", "[вариант 3]", "[вариант 4]"],
-    "explanation": "[объяснение с фактами]"
-}}
-
-ВАЖНО:
-- Вопрос должен быть основан на предоставленном тексте
-- Все варианты должны быть правдоподобными
-- Ответ ТОЛЬКО в формате JSON"""
-
+    def _validate_question(self, question_data: Dict, to_russian: bool) -> bool:
+        """Валидация сгенерированного вопроса"""
         try:
-            response = self.groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                temperature=0.7,
-                max_tokens=500,
-            )
+            # Проверяем наличие всех полей
+            required = ["question", "correct_answer", "options", "explanation"]
+            for field in required:
+                if field not in question_data:
+                    return False
             
-            content = response.choices[0].message.content.strip()
+            # Проверяем что есть 4 варианта
+            if len(question_data["options"]) != 4:
+                return False
             
-            if content.startswith("```json"):
-                content = content.replace("```json", "").replace("```", "").strip()
-            elif content.startswith("```"):
-                content = content.replace("```", "").strip()
+            # Проверяем что правильный ответ в вариантах
+            if question_data["correct_answer"] not in question_data["options"]:
+                return False
             
-            question_data = json.loads(content)
-            random.shuffle(question_data["options"])
+            # Для вопросов "на русский" - ответы должны быть русскими словами
+            if to_russian:
+                for opt in question_data["options"]:
+                    # Если есть марийские буквы - это неправильно
+                    if any(c in opt for c in "ӱӧӓӹ"):
+                        return False
             
-            question_data["type"] = "multiple_choice"
-            question_data["difficulty"] = difficulty
+            return True
             
-            return question_data
-            
-        except Exception as e:
-            logger.error(f"Ошибка генерации вопроса: {e}")
-            return self._generate_fallback_question()
-    
-    def _generate_fill_blank_question(self, difficulty: str) -> Dict:
-        """Генерация вопроса на заполнение пропуска"""
-        
-        context = self._get_rag_context("марийский язык предложения примеры")
-        
-        if not context:
-            return self._generate_fallback_question()
-        
-        prompt = f"""На основе этого текста, создай вопрос на заполнение пропуска.
-
-Текст: {context}
-
-Уровень: {difficulty}
-
-Формат ответа (строго JSON):
-{{
-    "question": "Заполните пропуск: [предложение с ___]",
-    "correct_answer": "[слово для пропуска]",
-    "options": ["[вариант 1]", "[вариант 2]", "[вариант 3]", "[вариант 4]"],
-    "explanation": "[объяснение]"
-}}
-
-Ответ ТОЛЬКО в формате JSON."""
-
-        try:
-            response = self.groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                temperature=0.7,
-                max_tokens=500,
-            )
-            
-            content = response.choices[0].message.content.strip()
-            
-            if content.startswith("```json"):
-                content = content.replace("```json", "").replace("```", "").strip()
-            elif content.startswith("```"):
-                content = content.replace("```", "").strip()
-            
-            question_data = json.loads(content)
-            random.shuffle(question_data["options"])
-            
-            question_data["type"] = "fill_blank"
-            question_data["difficulty"] = difficulty
-            
-            return question_data
-            
-        except Exception as e:
-            logger.error(f"Ошибка генерации вопроса: {e}")
-            return self._generate_fallback_question()
-    
-    def _generate_grammar_question(self, difficulty: str) -> Dict:
-        """Генерация вопроса по грамматике"""
-        
-        context = self._get_rag_context("марийская грамматика падежи глаголы")
-        
-        if not context:
-            return self._generate_fallback_question()
-        
-        prompt = f"""На основе этого текста, создай вопрос по грамматике марийского языка.
-
-Текст: {context}
-
-Уровень: {difficulty}
-
-Формат ответа (строго JSON):
-{{
-    "question": "[вопрос о грамматике]",
-    "correct_answer": "[правильный ответ]",
-    "options": ["[вариант 1]", "[вариант 2]", "[вариант 3]", "[вариант 4]"],
-    "explanation": "[грамматическое объяснение]"
-}}
-
-Ответ ТОЛЬКО в формате JSON."""
-
-        try:
-            response = self.groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                temperature=0.7,
-                max_tokens=500,
-            )
-            
-            content = response.choices[0].message.content.strip()
-            
-            if content.startswith("```json"):
-                content = content.replace("```json", "").replace("```", "").strip()
-            elif content.startswith("```"):
-                content = content.replace("```", "").strip()
-            
-            question_data = json.loads(content)
-            random.shuffle(question_data["options"])
-            
-            question_data["type"] = "grammar"
-            question_data["difficulty"] = difficulty
-            
-            return question_data
-            
-        except Exception as e:
-            logger.error(f"Ошибка генерации вопроса: {e}")
-            return self._generate_fallback_question()
+        except Exception:
+            return False
     
     def _generate_fallback_question(self) -> Dict:
-        """Резервный вопрос если генерация не удалась"""
+        """Резервные вопросы - гарантированно правильные"""
         fallback_questions = [
+            # Вопросы: марийский -> русский
             {
-                "question": "Как сказать 'привет' на марийском языке?",
-                "correct_answer": "Салам",
-                "options": ["Салам", "Привет", "Здраво", "Мерҥге"],
-                "explanation": "Салам - стандартное приветствие в марийском языке",
+                "question": "Как переводится марийское слово салам?",
+                "correct_answer": "привет",
+                "options": ["привет", "пока", "спасибо", "извини"],
+                "explanation": "салам = привет",
                 "type": "translation",
                 "difficulty": "easy"
             },
             {
-                "question": "Как сказать 'спасибо' на марийском?",
-                "correct_answer": "Тау",
-                "options": ["Тау", "Спасибо", "Благо", "Рахмат"],
-                "explanation": "Тау - выражение благодарности на марийском",
+                "question": "Как переводится марийское слово тау?",
+                "correct_answer": "спасибо",
+                "options": ["спасибо", "привет", "пока", "здравствуй"],
+                "explanation": "тау = спасибо",
                 "type": "translation",
                 "difficulty": "easy"
             },
             {
-                "question": "К какой языковой семье относится марийский язык?",
-                "correct_answer": "Финно-угорская",
-                "options": ["Финно-угорская", "Тюркская", "Славянская", "Монгольская"],
-                "explanation": "Марийский язык относится к финно-угорской языковой семье",
-                "type": "multiple_choice",
+                "question": "Как переводится марийское слово вӱд?",
+                "correct_answer": "вода",
+                "options": ["вода", "хлеб", "мясо", "молоко"],
+                "explanation": "вӱд = вода",
+                "type": "translation",
+                "difficulty": "easy"
+            },
+            {
+                "question": "Как переводится марийское слово кинде?",
+                "correct_answer": "хлеб",
+                "options": ["хлеб", "вода", "мясо", "соль"],
+                "explanation": "кинде = хлеб",
+                "type": "translation",
+                "difficulty": "easy"
+            },
+            {
+                "question": "Как переводится марийское слово пӧрт?",
+                "correct_answer": "дом",
+                "options": ["дом", "лес", "река", "поле"],
+                "explanation": "пӧрт = дом",
+                "type": "translation",
+                "difficulty": "easy"
+            },
+            {
+                "question": "Как переводится марийское слово кече?",
+                "correct_answer": "солнце",
+                "options": ["солнце", "луна", "звезда", "небо"],
+                "explanation": "кече = солнце",
+                "type": "translation",
                 "difficulty": "medium"
-            }
+            },
+            {
+                "question": "Как переводится марийское слово мланде?",
+                "correct_answer": "земля",
+                "options": ["земля", "небо", "вода", "огонь"],
+                "explanation": "мланде = земля",
+                "type": "translation",
+                "difficulty": "medium"
+            },
+            {
+                "question": "Как переводится марийское слово чодыра?",
+                "correct_answer": "лес",
+                "options": ["лес", "поле", "река", "гора"],
+                "explanation": "чодыра = лес",
+                "type": "translation",
+                "difficulty": "medium"
+            },
+            # Вопросы: русский -> марийский
+            {
+                "question": "Как сказать привет на марийском?",
+                "correct_answer": "салам",
+                "options": ["салам", "тау", "чеверын", "поро"],
+                "explanation": "привет = салам",
+                "type": "translation",
+                "difficulty": "easy"
+            },
+            {
+                "question": "Как сказать спасибо на марийском?",
+                "correct_answer": "тау",
+                "options": ["тау", "салам", "поро", "чеверын"],
+                "explanation": "спасибо = тау",
+                "type": "translation",
+                "difficulty": "easy"
+            },
+            {
+                "question": "Как сказать вода на марийском?",
+                "correct_answer": "вӱд",
+                "options": ["вӱд", "кинде", "шыл", "пӧрт"],
+                "explanation": "вода = вӱд",
+                "type": "translation",
+                "difficulty": "easy"
+            },
+            {
+                "question": "Как сказать хлеб на марийском?",
+                "correct_answer": "кинде",
+                "options": ["кинде", "вӱд", "шыл", "шӧр"],
+                "explanation": "хлеб = кинде",
+                "type": "translation",
+                "difficulty": "easy"
+            },
+            {
+                "question": "Как сказать дом на марийском?",
+                "correct_answer": "пӧрт",
+                "options": ["пӧрт", "чодыра", "эҥер", "курык"],
+                "explanation": "дом = пӧрт",
+                "type": "translation",
+                "difficulty": "easy"
+            },
+            {
+                "question": "Как сказать солнце на марийском?",
+                "correct_answer": "кече",
+                "options": ["кече", "тылзе", "шӱдыр", "каваш"],
+                "explanation": "солнце = кече",
+                "type": "translation",
+                "difficulty": "medium"
+            },
+            {
+                "question": "Как сказать лес на марийском?",
+                "correct_answer": "чодыра",
+                "options": ["чодыра", "пасу", "эҥер", "курык"],
+                "explanation": "лес = чодыра",
+                "type": "translation",
+                "difficulty": "medium"
+            },
+            {
+                "question": "Как сказать мать на марийском?",
+                "correct_answer": "ава",
+                "options": ["ава", "ача", "коча", "кува"],
+                "explanation": "мать = ава",
+                "type": "translation",
+                "difficulty": "easy"
+            },
         ]
         
-        return random.choice(fallback_questions)
+        # Выбираем вопрос, который ещё не использовался
+        available = [q for q in fallback_questions if q["correct_answer"].lower() not in self.used_words]
+        
+        if not available:
+            # Если все использованы, очищаем и начинаем заново
+            self.used_words.clear()
+            available = fallback_questions
+        
+        question = random.choice(available)
+        self.used_words.add(question["correct_answer"].lower())
+        
+        # Перемешиваем варианты
+        options = question["options"].copy()
+        random.shuffle(options)
+        question["options"] = options
+        
+        return question
     
     def generate_quiz(self, num_questions: int = 5, difficulty: str = "medium") -> List[Dict]:
-        """
-        Генерация полного теста
+        """Генерация полного теста"""
+        # Очищаем использованные слова для нового теста
+        self.used_words.clear()
         
-        Args:
-            num_questions: количество вопросов
-            difficulty: уровень сложности
-            
-        Returns:
-            Список вопросов
-        """
         questions = []
         
         for i in range(num_questions):
@@ -363,12 +365,7 @@ class QuizSession:
         return None
     
     def submit_answer(self, answer: str) -> Dict:
-        """
-        Отправить ответ на текущий вопрос
-        
-        Returns:
-            Dict с результатом (correct, explanation, score)
-        """
+        """Отправить ответ на текущий вопрос"""
         current_question = self.get_current_question()
         
         if not current_question:
@@ -407,7 +404,6 @@ class QuizSession:
         
         percentage = (self.score / len(self.questions)) * 100
         
-        # Определение уровня
         if percentage >= 90:
             level = "Отлично! 🌟"
         elif percentage >= 70:
@@ -428,5 +424,5 @@ class QuizSession:
         }
     
     def get_progress(self) -> str:
-        """Получить прогресс в виде строки"""
+        """Получить прогресс"""
         return f"{self.current_question_index + 1}/{len(self.questions)}"
