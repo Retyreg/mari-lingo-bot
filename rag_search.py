@@ -5,7 +5,10 @@ RAG Search Interface
 """
 
 import sys
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 try:
     import chromadb
@@ -19,59 +22,63 @@ except ImportError as e:
 
 
 class RAGSearcher:
-    """Класс для поиска по RAG базе"""
-    
+    """Класс для поиска по RAG базе.
+
+    Если базы нет или коллекция не загружается — переходит в degraded-режим:
+    `search()` возвращает None, бот продолжает работать, но без RAG-контекста.
+    """
+
     def __init__(self, db_path: str = "./rag_database"):
-        """
-        Инициализация поисковика
-        
-        Args:
-            db_path: Путь к базе данных
-        """
-        db_path = Path(db_path)
-        
-        if not db_path.exists():
-            print(f"❌ База данных не найдена: {db_path}")
-            print("   Сначала создайте базу с помощью pdf_to_rag.py")
-            sys.exit(1)
-        
-        print(f"🚀 Загрузка модели...")
-        self.model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
-        
-        print(f"📚 Подключение к базе данных...")
-        self.client = chromadb.PersistentClient(
-            path=str(db_path),
-            settings=Settings(anonymized_telemetry=False)
-        )
-        
+        self.db_path = Path(db_path)
+        self.model = None
+        self.client = None
+        self.collection = None
+        self.available = False
+
+        if not self.db_path.exists():
+            logger.warning(
+                "RAG база не найдена: %s. Бот стартует без RAG (ответы без контекста). "
+                "Создайте базу через pdf_to_rag.py.",
+                self.db_path,
+            )
+            return
+
         try:
+            logger.info("Загрузка модели эмбеддингов…")
+            self.model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
+
+            logger.info("Подключение к RAG базе…")
+            self.client = chromadb.PersistentClient(
+                path=str(self.db_path),
+                settings=Settings(anonymized_telemetry=False),
+            )
             self.collection = self.client.get_collection("documents")
             doc_count = self.collection.count()
-            print(f"✅ База загружена ({doc_count} документов)\n")
+            self.available = True
+            logger.info("RAG база загружена (%d документов)", doc_count)
         except Exception as e:
-            print(f"❌ Ошибка загрузки коллекции: {e}")
-            sys.exit(1)
+            logger.warning("RAG init failed: %s. Бот работает без контекста.", e)
+            self.available = False
     
     def search(self, query: str, n_results: int = 5):
         """
-        Поиск по запросу
-        
-        Args:
-            query: Поисковый запрос
-            n_results: Количество результатов
+        Поиск по запросу. В degraded-режиме (база не загружена) возвращает None.
         """
+        if not self.available:
+            return None
+
         print(f"🔍 Поиск: '{query}'")
         print("   Создание эмбеддинга запроса...")
-        
+
         # Создание эмбеддинга
         query_embedding = self.model.encode([query])[0]
-        
+
         # Поиск
         results = self.collection.query(
             query_embeddings=[query_embedding.tolist()],
             n_results=n_results
         )
-        
+
         if not results['documents'][0]:
             print("\n❌ Результаты не найдены")
             return

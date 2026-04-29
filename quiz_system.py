@@ -14,11 +14,13 @@ logger = logging.getLogger(__name__)
 
 
 class QuizGenerator:
-    """Генератор тестов на основе RAG базы и Groq AI"""
-    
-    def __init__(self, rag_searcher, groq_client):
+    """Генератор тестов на основе RAG базы и LLM (через OpenRouter)"""
+
+    def __init__(self, rag_searcher, llm_client, model: str = "anthropic/claude-3.5-haiku", llm_kwargs: Optional[Dict] = None):
         self.rag_searcher = rag_searcher
-        self.groq_client = groq_client
+        self.llm_client = llm_client
+        self.model = model
+        self.llm_kwargs = llm_kwargs or {}
         self.question_types = [
             "translation_to_russian",
             "translation_to_mari",
@@ -105,11 +107,12 @@ class QuizGenerator:
 {{"question": "Как сказать толкать на марийском?", "correct_answer": "шӱкаш", "options": ["шӱкаш", "кошташ", "ошкылаш", "шогаш"], "explanation": "толкать = шӱкаш"}}"""
 
         try:
-            response = self.groq_client.chat.completions.create(
+            response = self.llm_client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
+                model=self.model,
                 temperature=0.8,
                 max_tokens=400,
+                **self.llm_kwargs,
             )
             
             content = response.choices[0].message.content.strip()

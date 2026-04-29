@@ -3,8 +3,8 @@
 # Telegram Bot
 python-telegram-bot>=20.0
 
-# Claude API
-anthropic>=0.18.0
+# LLM через OpenRouter (OpenAI-совместимый клиент)
+openai>=1.30.0
 
 # RAG компоненты (уже установлены из requirements.txt)
 # pymupdf>=1.23.0

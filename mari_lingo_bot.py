@@ -1,6 +1,6 @@
 """
 Mari Lingo Bot - Telegram бот для изучения марийского языка
-Интеграция с RAG базой знаний и Claude API
+Интеграция с RAG базой знаний и LLM через OpenRouter
 """
 
 import os
@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import anthropic
+from openai import OpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, 
@@ -39,12 +39,33 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-RAG_DB_PATH = os.getenv("RAG_DB_PATH", "/Users/dmitrijvatutov/Desktop/1AI/Projects/RAG from PDF/files/rag_database")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+LLM_MODEL = os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku")
+RAG_DB_PATH = os.getenv("RAG_DB_PATH", "./rag_database")
 USER_DATA_PATH = "./user_data"
 
-# Инициализация клиентов
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# Инициализация LLM-клиента (OpenRouter, OpenAI-совместимый)
+# Плейсхолдер вместо None, чтобы SDK не падал на импорте — отсутствие ключа
+# проверяется в main() и приводит к корректному выходу с понятной ошибкой.
+llm_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY or "missing-openrouter-key",
+)
+
+_OPENROUTER_HEADERS = {
+    "HTTP-Referer": "https://github.com/Retyreg/mari-lingo-bot",
+    "X-Title": "Mari Lingo Bot",
+}
+
+
+def _llm_kwargs() -> Dict:
+    """Доп. параметры: заголовки и пиннинг провайдера для llama-моделей."""
+    kwargs: Dict = {"extra_headers": _OPENROUTER_HEADERS}
+    if LLM_MODEL.startswith("meta-llama/"):
+        kwargs["extra_body"] = {"provider": {"order": ["Groq"]}}
+    return kwargs
+
+
 rag_searcher = RAGSearcher(db_path=RAG_DB_PATH)
 
 # Создание директории для данных пользователей
@@ -284,16 +305,17 @@ class MariLingoBot:
 
 Ответь на вопрос, используя контекст."""
 
-            response = claude_client.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = llm_client.chat.completions.create(
+                model=LLM_MODEL,
                 max_tokens=1000,
-                system=system_prompt,
                 messages=[
-                    {"role": "user", "content": user_prompt}
-                ]
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                **_llm_kwargs(),
             )
-            
-            bot_response = response.content[0].text
+
+            bot_response = response.choices[0].message.content
             
             # Отправка ответа
             await update.message.reply_text(bot_response)
@@ -362,17 +384,18 @@ class MariLingoBot:
             if rag_results and rag_results['documents'][0]:
                 context = rag_results['documents'][0][0][:300]
                 
-                # Просим Claude извлечь слово и его значение
-                response = claude_client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                # Просим LLM извлечь слово и его значение
+                response = llm_client.chat.completions.create(
+                    model=LLM_MODEL,
                     max_tokens=200,
                     messages=[{
                         "role": "user",
                         "content": f"Из этого текста найди марийское слово и его перевод на русский:\n{context}\n\nОтветь в формате: Слово | Перевод"
-                    }]
+                    }],
+                    **_llm_kwargs(),
                 )
-                
-                flashcard_text = response.content[0].text
+
+                flashcard_text = response.choices[0].message.content
                 
                 keyboard = [
                     [InlineKeyboardButton("🔄 Следующее слово", callback_data="mode_flashcard")],
@@ -427,8 +450,9 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN не установлен!")
         return
     
-    if not ANTHROPIC_API_KEY:
-        logger.error("ANTHROPIC_API_KEY не установлен!")
+    if not OPENROUTER_API_KEY:
+        logger.error("OPENROUTER_API_KEY не установлен!")
+        logger.info("Получите ключ на: https://openrouter.ai/keys")
         return
     
     # Создание приложения
@@ -445,7 +469,7 @@ def main():
     application.add_handler(CallbackQueryHandler(bot.handle_callback))
     
     # Запуск бота
-    logger.info("🚀 Mari Lingo Bot запущен!")
+    logger.info(f"🚀 Mari Lingo Bot запущен (OpenRouter / {LLM_MODEL})!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

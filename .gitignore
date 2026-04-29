@@ -36,9 +36,6 @@ venv/
 ENV/
 env/
 
-# RAG Database (опционально, если большая)
-# rag_database/
-
 # Логи
 *.log
 bot.log

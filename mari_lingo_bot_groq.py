@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from groq import Groq
+from openai import OpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -44,16 +44,37 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+LLM_MODEL = os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku")
 RAG_DB_PATH = os.getenv("RAG_DB_PATH", "./rag_database")
 USER_DATA_PATH = "./user_data"
 
-# Инициализация клиентов
-groq_client = Groq(api_key=GROQ_API_KEY)
+# Инициализация LLM-клиента (OpenRouter, OpenAI-совместимый).
+# Плейсхолдер вместо None, чтобы SDK не падал на импорте — отсутствие ключа
+# проверяется в main() и приводит к корректному выходу с понятной ошибкой.
+llm_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY or "missing-openrouter-key",
+)
+
+_OPENROUTER_HEADERS = {
+    "HTTP-Referer": "https://github.com/Retyreg/mari-lingo-bot",
+    "X-Title": "Mari Lingo Bot",
+}
+
+
+def _llm_kwargs() -> Dict:
+    """Доп. параметры: заголовки и пиннинг провайдера для llama-моделей."""
+    kwargs: Dict = {"extra_headers": _OPENROUTER_HEADERS}
+    if LLM_MODEL.startswith("meta-llama/"):
+        kwargs["extra_body"] = {"provider": {"order": ["Groq"]}}
+    return kwargs
+
+
 rag_searcher = RAGSearcher(db_path=RAG_DB_PATH)
 
 # Инициализация генератора квизов
-quiz_generator = QuizGenerator(rag_searcher, groq_client)
+quiz_generator = QuizGenerator(rag_searcher, llm_client, model=LLM_MODEL, llm_kwargs=_llm_kwargs())
 
 # Создание директории для данных пользователей
 Path(USER_DATA_PATH).mkdir(exist_ok=True)
@@ -399,14 +420,15 @@ class MariLingoBot:
 
 Ответь на вопрос, используя контекст."""
 
-            chat_completion = groq_client.chat.completions.create(
+            chat_completion = llm_client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                model="llama-3.3-70b-versatile",
+                model=LLM_MODEL,
                 temperature=0.7,
                 max_tokens=1024,
+                **_llm_kwargs(),
             )
             
             bot_response = chat_completion.choices[0].message.content
@@ -1048,9 +1070,9 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN не установлен!")
         return
     
-    if not GROQ_API_KEY:
-        logger.error("GROQ_API_KEY не установлен!")
-        logger.info("Получите бесплатный ключ на: https://console.groq.com/")
+    if not OPENROUTER_API_KEY:
+        logger.error("OPENROUTER_API_KEY не установлен!")
+        logger.info("Получите ключ на: https://openrouter.ai/keys")
         return
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1062,7 +1084,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(CallbackQueryHandler(bot.handle_callback))
     
-    logger.info("🚀 Mari Lingo Bot запущен (Groq AI + Gamification)!")
+    logger.info(f"🚀 Mari Lingo Bot запущен (OpenRouter / {LLM_MODEL} + Gamification)!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
