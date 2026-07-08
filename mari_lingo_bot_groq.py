@@ -5,13 +5,15 @@ Mari Lingo Bot - Telegram бот для изучения марийского я
 
 import os
 import json
+import random
 import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from openai import OpenAI
+from groq import Groq
+import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -31,6 +33,7 @@ import sys
 sys.path.append('.')
 from rag_search import RAGSearcher
 from quiz_system import QuizGenerator, QuizSession
+from grammar_exercises import generate_exercise_set, ExerciseSession, get_topics
 from spaced_repetition import SpacedRepetitionSystem, FlashCard
 from gamification import GamificationSystem, LEVELS, get_leaderboard, format_leaderboard
 from flashcard_system import FlashcardDeck, FlashcardManager, FlashCard as FC, format_flashcard_message, format_session_stats
@@ -44,37 +47,21 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 RAG_DB_PATH = os.getenv("RAG_DB_PATH", "./rag_database")
 USER_DATA_PATH = "./user_data"
 
-# Инициализация LLM-клиента (OpenRouter, OpenAI-совместимый).
-# Плейсхолдер вместо None, чтобы SDK не падал на импорте — отсутствие ключа
-# проверяется в main() и приводит к корректному выходу с понятной ошибкой.
-llm_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY or "missing-openrouter-key",
-)
-
-_OPENROUTER_HEADERS = {
-    "HTTP-Referer": "https://github.com/Retyreg/mari-lingo-bot",
-    "X-Title": "Mari Lingo Bot",
-}
-
-
-def _llm_kwargs() -> Dict:
-    """Доп. параметры: заголовки и пиннинг провайдера для llama-моделей."""
-    kwargs: Dict = {"extra_headers": _OPENROUTER_HEADERS}
-    if LLM_MODEL.startswith("meta-llama/"):
-        kwargs["extra_body"] = {"provider": {"order": ["Groq"]}}
-    return kwargs
-
-
+# Инициализация клиентов
+groq_client = Groq(api_key=GROQ_API_KEY)
+# Клод используется как независимый проверяющий для сгенерированных
+# вопросов теста (см. QuizGenerator) — необязателен: если ключ не задан,
+# генератор просто пропускает эту проверку.
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 rag_searcher = RAGSearcher(db_path=RAG_DB_PATH)
 
 # Инициализация генератора квизов
-quiz_generator = QuizGenerator(rag_searcher, llm_client, model=LLM_MODEL, llm_kwargs=_llm_kwargs())
+quiz_generator = QuizGenerator(rag_searcher, groq_client, verifier_client=anthropic_client)
 
 # Создание директории для данных пользователей
 Path(USER_DATA_PATH).mkdir(exist_ok=True)
@@ -151,6 +138,7 @@ class MariLingoBot:
             self.user_sessions[user_id] = {
                 "mode": "chat",
                 "quiz_state": None,
+                "exercise_state": None,
                 "flashcard_state": None,
                 "sr_state": None,
                 "progress": UserProgress(user_id),
@@ -420,15 +408,14 @@ class MariLingoBot:
 
 Ответь на вопрос, используя контекст."""
 
-            chat_completion = llm_client.chat.completions.create(
+            chat_completion = groq_client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                model=LLM_MODEL,
+                model="llama-3.3-70b-versatile",
                 temperature=0.7,
                 max_tokens=1024,
-                **_llm_kwargs(),
             )
             
             bot_response = chat_completion.choices[0].message.content
@@ -506,18 +493,31 @@ class MariLingoBot:
         elif data == "mode_exercise":
             await self.start_exercise_mode(query, session)
         
+        elif data == "quiz_next":
+            await self.show_next_quiz_question(query, session)
+
+        elif data == "quiz_finish":
+            await self.finish_quiz(query, session)
+
         elif data.startswith("quiz_"):
             difficulty = data.replace("quiz_", "")
             await self.start_quiz_session(query, session, difficulty)
-        
+
         elif data.startswith("answer_"):
             await self.handle_quiz_answer_callback(query, session, data)
-        
-        elif data == "quiz_next":
-            await self.show_next_quiz_question(query, session)
-        
-        elif data == "quiz_finish":
-            await self.finish_quiz(query, session)
+
+        elif data == "exercise_next":
+            await self.show_exercise_item(query, session)
+
+        elif data == "exercise_finish":
+            await self.finish_exercise_session(query, session)
+
+        elif data.startswith("extopic_"):
+            topic_key = data.replace("extopic_", "")
+            await self.start_exercise_session(query, session, topic_key)
+
+        elif data.startswith("exans_"):
+            await self.handle_exercise_answer_callback(query, session, data)
         
         elif data == "show_progress":
             profile_text = gamification.get_profile_summary()
@@ -840,35 +840,52 @@ class MariLingoBot:
                 parse_mode="Markdown"
             )
     
+    @staticmethod
+    def _highlight_target_word(question: Dict) -> str:
+        """Выделяет жирным то самое слово, которое нужно перевести, чтобы
+        оно не терялось в формулировке вопроса. word_mari и word_russian
+        — это марийская и русская стороны пары, но в тексте вопроса
+        встречается только ОДНА из них (вторая — это как раз ответ),
+        поэтому подставляем ту, что реально нашлась."""
+        # Telegram parse_mode="Markdown" (legacy) — жирный текст это ОДНА
+        # звёздочка (*text*), а не двойная. Двойная — синтаксис обычного
+        # Markdown/CommonMark, Telegram его не поддерживает и в лучшем
+        # случае молча съедает как пустые сущности, не выделяя текст.
+        text = question.get("question", "")
+        for candidate in (question.get("word_mari"), question.get("word_russian")):
+            if candidate and candidate in text:
+                return text.replace(candidate, f"*{candidate}*")
+        return text
+
     async def show_quiz_question(self, query, session):
         """Показать текущий вопрос"""
         quiz_session = session.get("quiz_state")
-        
+
         if not quiz_session or quiz_session.is_finished():
             await self.finish_quiz(query, session)
             return
-        
+
         question = quiz_session.get_current_question()
-        
+
         if not question:
             await self.finish_quiz(query, session)
             return
-        
+
         progress = quiz_session.get_progress()
         question_text = f"""
-📝 **Вопрос {progress}**
+📝 *Вопрос {progress}*
 
-{question['question']}
+{self._highlight_target_word(question)}
 
 Выберите правильный ответ:
 """
-        
+
         keyboard = []
         for i, option in enumerate(question['options']):
-            emoji = ['🅰️', '🅱️', '🅲', '🅳'][i]
+            emoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'][i]
             keyboard.append([
                 InlineKeyboardButton(
-                    f"{emoji} {option}", 
+                    f"{emoji} {option}",
                     callback_data=f"answer_{i}_{option}"
                 )
             ])
@@ -895,7 +912,8 @@ class MariLingoBot:
         
         user_answer = parts[2]
         result = quiz_session.submit_answer(user_answer)
-        
+        self._sync_quiz_result_to_flashcards(query, session, result)
+
         if result['correct']:
             result_emoji = "✅"
             result_text = "**Правильно!**"
@@ -927,6 +945,37 @@ class MariLingoBot:
             parse_mode="Markdown"
         )
     
+    def _sync_quiz_result_to_flashcards(self, query, session, result: Dict):
+        """
+        Отражает результат вопроса теста в колоде карточек.
+
+        Раньше тест обновлял только геймификацию и историю в progress —
+        "Статистика карточек" (FlashcardDeck) вообще не знала о том, что
+        тест проходился, и всегда показывала 0 выученных слов, даже если
+        пользователь активно занимался. Теперь каждое слово из теста
+        либо обновляет существующую карточку, либо создаёт новую.
+        """
+        word_mari = result.get("word_mari")
+        word_russian = result.get("word_russian")
+        if not word_mari or not word_russian:
+            return
+
+        deck = session.get("flashcard_deck")
+        if deck is None:
+            deck = FlashcardDeck(query.from_user.id, USER_DATA_PATH)
+            session["flashcard_deck"] = deck
+
+        key = word_mari.strip().lower()
+        card = deck.cards.get(key)
+        if card is None:
+            card = FC(word_mari=key, word_russian=word_russian.strip().lower(), category="из теста")
+            deck.cards[key] = card
+
+        # Тест даёт только бинарный результат (верно/неверно), поэтому
+        # используем крайние значения шкалы качества SM-2 (0-5).
+        card.update_after_review(5 if result["correct"] else 1)
+        deck.save()
+
     async def show_next_quiz_question(self, query, session):
         """Показать следующий вопрос"""
         await self.show_quiz_question(query, session)
@@ -1047,20 +1096,175 @@ class MariLingoBot:
         )
     
     async def start_exercise_mode(self, query, session):
-        """Запуск режима упражнений"""
+        """Запуск режима упражнений — выбор темы грамматики"""
         session["mode"] = "exercise"
+
+        text = """
+📝 *Грамматические упражнения*
+
+Выбери тему (или пройди вперемешку):
+
+Каждое упражнение — предложение с пропуском и реальными вариантами
+из учебника «Mari: An Essential Grammar for International Learners»
+(Riese, Bradley, Yefremova). Правильный ответ сверен с ответами
+самого учебника, а не придуман ботом.
+"""
+        topics = get_topics()
+        keyboard = [
+            [InlineKeyboardButton(f"📖 {t}", callback_data=f"extopic_{i}")]
+            for i, t in enumerate(topics)
+        ]
+        keyboard.append([InlineKeyboardButton("🔀 Вперемешку", callback_data="extopic_mixed")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
+
         await query.edit_message_text(
-            "📝 **Режим упражнений**\n\n(Функция в разработке)\n\nПопробуй задать вопрос в режиме чата!",
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
-    
+
+    async def start_exercise_session(self, query, session, topic_key: str):
+        """Начало сессии упражнений по выбранной теме"""
+        topics = get_topics()
+        topic = None
+        if topic_key != "mixed":
+            try:
+                topic = topics[int(topic_key)]
+            except (ValueError, IndexError):
+                topic = None
+
+        exercises = generate_exercise_set(num_exercises=5, topic=topic)
+        exercise_session = ExerciseSession(query.from_user.id, exercises)
+        session["exercise_state"] = exercise_session
+
+        await self.show_exercise_item(query, session)
+
+    async def show_exercise_item(self, query, session):
+        """Показать текущее упражнение"""
+        exercise_session = session.get("exercise_state")
+
+        if not exercise_session or exercise_session.is_finished():
+            await self.finish_exercise_session(query, session)
+            return
+
+        exercise = exercise_session.get_current_exercise()
+        if not exercise:
+            await self.finish_exercise_session(query, session)
+            return
+
+        progress = exercise_session.get_progress()
+        text = f"""
+📝 *Упражнение {progress}*
+_{exercise['topic']}_
+
+{exercise['sentence']}
+
+Выбери правильный вариант:
+"""
+        options = exercise["options"].copy()
+        random.shuffle(options)
+
+        keyboard = []
+        for i, option in enumerate(options):
+            emoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'][i]
+            keyboard.append([
+                InlineKeyboardButton(f"{emoji} {option}", callback_data=f"exans_{i}_{option}")
+            ])
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    async def handle_exercise_answer_callback(self, query, session, callback_data: str):
+        """Обработка ответа на упражнение"""
+        exercise_session = session.get("exercise_state")
+
+        if not exercise_session:
+            await query.edit_message_text("Ошибка: сессия упражнений не найдена")
+            return
+
+        parts = callback_data.split("_", 2)
+        if len(parts) < 3:
+            return
+
+        user_answer = parts[2]
+        result = exercise_session.submit_answer(user_answer)
+
+        progress = session["progress"]
+        progress.add_question(result["correct"])
+
+        if result["correct"]:
+            feedback = "✅ *Верно!*"
+        else:
+            feedback = f"❌ *Неверно.*\n\nПравильный вариант: *{result['correct_answer']}*"
+
+        text = f"""
+{feedback}
+
+{result['sentence']}
+
+📊 Счёт: {result['score']}/{result['total']}
+_Источник: {result['source']}_
+"""
+        if exercise_session.is_finished():
+            keyboard = [[InlineKeyboardButton("📊 Показать результаты", callback_data="exercise_finish")]]
+        else:
+            keyboard = [[InlineKeyboardButton("➡️ Следующее упражнение", callback_data="exercise_next")]]
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    async def finish_exercise_session(self, query, session):
+        """Завершение сессии упражнений и показ результатов"""
+        exercise_session = session.get("exercise_state")
+        gamification = session["gamification"]
+
+        if not exercise_session:
+            await query.edit_message_text("Ошибка: сессия упражнений не найдена")
+            return
+
+        results = exercise_session.get_final_results()
+        game_result = gamification.record_quiz_completed(
+            correct=results["score"],
+            total=results["total"]
+        )
+
+        text = f"""
+{results['level']}
+
+📊 *Упражнения завершены!*
+
+✅ Правильно: {results['score']}/{results['total']}
+📈 Процент: {results['percentage']:.1f}%
+⏱ Время: {results['duration_seconds']} сек
+
+⭐ *+{game_result['xp_earned']} XP*
+"""
+        keyboard = [
+            [InlineKeyboardButton("📝 Ещё упражнения", callback_data="mode_exercise")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+        ]
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
     async def handle_quiz_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE, answer: str):
         """Обработка ответа в режиме теста"""
         pass
-    
+
     async def handle_exercise_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE, answer: str):
-        """Обработка ответа в упражнении"""
-        pass
+        """Обработка текстового сообщения в режиме упражнений (ответы даются кнопками)"""
+        await update.message.reply_text(
+            "Выбери вариант ответа кнопкой выше 👆 (или набери /start, чтобы выйти)."
+        )
 
 
 def main():
@@ -1070,9 +1274,9 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN не установлен!")
         return
     
-    if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY не установлен!")
-        logger.info("Получите ключ на: https://openrouter.ai/keys")
+    if not GROQ_API_KEY:
+        logger.error("GROQ_API_KEY не установлен!")
+        logger.info("Получите бесплатный ключ на: https://console.groq.com/")
         return
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1084,7 +1288,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(CallbackQueryHandler(bot.handle_callback))
     
-    logger.info(f"🚀 Mari Lingo Bot запущен (OpenRouter / {LLM_MODEL} + Gamification)!")
+    logger.info("🚀 Mari Lingo Bot запущен (Groq AI + Gamification)!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

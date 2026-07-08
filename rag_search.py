@@ -5,10 +5,8 @@ RAG Search Interface
 """
 
 import sys
-import logging
 from pathlib import Path
-
-logger = logging.getLogger(__name__)
+from typing import List, Optional
 
 try:
     import chromadb
@@ -21,64 +19,79 @@ except ImportError as e:
     sys.exit(1)
 
 
+# Источники в общей RAG-базе, не относящиеся к обучению марийскому языку
+# или вытесненные более новой версией. Базу не трогаем физически (она
+# используется и другими проектами) — просто никогда не подмешиваем эти
+# файлы в результаты поиска для Mari Lingo Bot.
+#   - Getica: историческая статья о готах Иордана, марийской лексики не содержит
+#   - eg-temp.pdf: черновик 2019 г. грамматики, вытеснен финальной eg2022.pdf
+EXCLUDED_SOURCES = [
+    "The_Peoples_of_Hermanaric_Jordanes,_Getica_116_Irma_Korkkanen_Z.pdf",
+    "eg-temp.pdf",
+]
+
+
 class RAGSearcher:
-    """Класс для поиска по RAG базе.
-
-    Если базы нет или коллекция не загружается — переходит в degraded-режим:
-    `search()` возвращает None, бот продолжает работать, но без RAG-контекста.
-    """
-
+    """Класс для поиска по RAG базе"""
+    
     def __init__(self, db_path: str = "./rag_database"):
-        self.db_path = Path(db_path)
-        self.model = None
-        self.client = None
-        self.collection = None
-        self.available = False
-
-        if not self.db_path.exists():
-            logger.warning(
-                "RAG база не найдена: %s. Бот стартует без RAG (ответы без контекста). "
-                "Создайте базу через pdf_to_rag.py.",
-                self.db_path,
-            )
-            return
-
+        """
+        Инициализация поисковика
+        
+        Args:
+            db_path: Путь к базе данных
+        """
+        db_path = Path(db_path)
+        
+        if not db_path.exists():
+            print(f"❌ База данных не найдена: {db_path}")
+            print("   Сначала создайте базу с помощью pdf_to_rag.py")
+            sys.exit(1)
+        
+        print(f"🚀 Загрузка модели...")
+        self.model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
+        
+        print(f"📚 Подключение к базе данных...")
+        self.client = chromadb.PersistentClient(
+            path=str(db_path),
+            settings=Settings(anonymized_telemetry=False)
+        )
+        
         try:
-            logger.info("Загрузка модели эмбеддингов…")
-            self.model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
-
-            logger.info("Подключение к RAG базе…")
-            self.client = chromadb.PersistentClient(
-                path=str(self.db_path),
-                settings=Settings(anonymized_telemetry=False),
-            )
             self.collection = self.client.get_collection("documents")
             doc_count = self.collection.count()
-            self.available = True
-            logger.info("RAG база загружена (%d документов)", doc_count)
+            print(f"✅ База загружена ({doc_count} документов)\n")
         except Exception as e:
-            logger.warning("RAG init failed: %s. Бот работает без контекста.", e)
-            self.available = False
+            print(f"❌ Ошибка загрузки коллекции: {e}")
+            sys.exit(1)
     
-    def search(self, query: str, n_results: int = 5):
+    def search(self, query: str, n_results: int = 5, filenames: Optional[List[str]] = None):
         """
-        Поиск по запросу. В degraded-режиме (база не загружена) возвращает None.
-        """
-        if not self.available:
-            return None
+        Поиск по запросу
 
+        Args:
+            query: Поисковый запрос
+            n_results: Количество результатов
+            filenames: Если указано, ограничить поиск этими файлами-источниками
+        """
         print(f"🔍 Поиск: '{query}'")
         print("   Создание эмбеддинга запроса...")
 
         # Создание эмбеддинга
         query_embedding = self.model.encode([query])[0]
 
-        # Поиск
+        # Поиск. Если явный список файлов не передан (например, свободный
+        # чат-режим), всё равно исключаем заведомо непригодные источники.
+        if filenames:
+            where = {"filename": {"$in": filenames}}
+        else:
+            where = {"filename": {"$nin": EXCLUDED_SOURCES}}
         results = self.collection.query(
             query_embeddings=[query_embedding.tolist()],
-            n_results=n_results
+            n_results=n_results,
+            where=where
         )
-
+        
         if not results['documents'][0]:
             print("\n❌ Результаты не найдены")
             return
