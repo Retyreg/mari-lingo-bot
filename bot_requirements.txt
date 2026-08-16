@@ -6,11 +6,13 @@ python-telegram-bot>=20.0
 # LLM через OpenRouter (OpenAI-совместимый клиент)
 openai>=1.30.0
 
-# RAG компоненты (уже установлены из requirements.txt)
-# pymupdf>=1.23.0
-# chromadb>=0.4.0
-# sentence-transformers>=2.2.0
-# tqdm>=4.65.0
+# RAG компоненты.
+# Раньше были закомментированы со ссылкой на requirements.txt, которого в этом
+# репозитории нет, — установка строго по README не поднимала бота вообще.
+# Тянут за собой torch (~2 ГБ). Без них бот стартует в degraded-режиме:
+# отвечает, но без контекста из базы знаний.
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
 
 # Дополнительные утилиты
 python-dotenv>=1.0.0  # Для .env файлов

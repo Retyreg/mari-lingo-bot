@@ -10,22 +10,28 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Зависимости RAG тяжёлые (chromadb + torch) и нужны только для поиска по базе.
+# Их отсутствие НЕ должно ронять импорт: бот умеет работать в degraded-режиме,
+# а `sys.exit(1)` прямо на импорте убивал процесс до всех проверок в main().
 try:
     import chromadb
     from sentence_transformers import SentenceTransformer
     from chromadb.config import Settings
-except ImportError as e:
-    print(f"❌ Ошибка импорта: {e}")
-    print("\n📦 Установите зависимости:")
-    print("pip install chromadb sentence-transformers")
-    sys.exit(1)
+
+    RAG_DEPS_ERROR = None
+except ImportError as e:  # pragma: no cover - зависит от окружения
+    chromadb = None
+    SentenceTransformer = None
+    Settings = None
+    RAG_DEPS_ERROR = e
 
 
 class RAGSearcher:
     """Класс для поиска по RAG базе.
 
-    Если базы нет или коллекция не загружается — переходит в degraded-режим:
-    `search()` возвращает None, бот продолжает работать, но без RAG-контекста.
+    Если зависимости не установлены, базы нет или коллекция не загружается —
+    переходит в degraded-режим: `search()` возвращает None, бот продолжает
+    работать, но без RAG-контекста.
     """
 
     def __init__(self, db_path: str = "./rag_database"):
@@ -34,6 +40,15 @@ class RAGSearcher:
         self.client = None
         self.collection = None
         self.available = False
+
+        if RAG_DEPS_ERROR is not None:
+            logger.warning(
+                "RAG-зависимости не установлены (%s). Бот стартует без RAG "
+                "(ответы без контекста). Установите: "
+                "pip install chromadb sentence-transformers",
+                RAG_DEPS_ERROR,
+            )
+            return
 
         if not self.db_path.exists():
             logger.warning(
@@ -203,9 +218,20 @@ def main():
     )
     
     args = parser.parse_args()
-    
+
+    # В CLI-режиме работать без RAG бессмысленно — выходим с понятной ошибкой.
+    if RAG_DEPS_ERROR is not None:
+        print(f"❌ Ошибка импорта: {RAG_DEPS_ERROR}")
+        print("\n📦 Установите зависимости:")
+        print("pip install chromadb sentence-transformers")
+        sys.exit(1)
+
     # Инициализация поисковика
     searcher = RAGSearcher(args.db_path)
+
+    if not searcher.available:
+        print(f"❌ RAG база недоступна: {args.db_path}")
+        sys.exit(1)
     
     # Режим статистики
     if args.stats:

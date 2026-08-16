@@ -1,5 +1,12 @@
 # 🚀 Быстрая настройка Mari Lingo Bot с Groq AI (бесплатно!)
 
+> ⚠️ **Документ устарел.** С коммита `c82445e` бот ходит в LLM только через
+> OpenRouter и читает `OPENROUTER_API_KEY`; переменная `GROQ_API_KEY` больше
+> нигде не используется — настройка по этой инструкции бота не поднимет.
+> Актуальное: [README](README.md) и [deploy/README.md](deploy/README.md).
+> Groq никуда не делся: укажите `LLM_MODEL=meta-llama/llama-3.3-70b-instruct`,
+> и бот автоматически пинит провайдера Groq через OpenRouter.
+
 ## Почему Groq?
 
 ✅ **БЕСПЛАТНО** - 30 запросов в минуту бесплатно  
