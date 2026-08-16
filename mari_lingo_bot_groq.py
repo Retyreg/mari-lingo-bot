@@ -49,6 +49,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku")
 RAG_DB_PATH = os.getenv("RAG_DB_PATH", "./rag_database")
 USER_DATA_PATH = "./user_data"
 
+# Маркер degraded-режима: RAG ничего не вернул. Сравнением с ним обработчик
+# ошибок понимает, есть ли что показать пользователю как fallback.
+NO_RAG_CONTEXT = "Контекст не найден в базе знаний."
+
 # Инициализация LLM-клиента (OpenRouter, OpenAI-совместимый).
 # Плейсхолдер вместо None, чтобы SDK не падал на импорте — отсутствие ключа
 # проверяется в main() и приводит к корректному выходу с понятной ошибкой.
@@ -326,7 +330,7 @@ class MariLingoBot:
 /help - Эта справка
 /progress - Твой профиль
 
-⚡ Powered by Groq AI
+⚡ Powered by OpenRouter
 """
         await update.message.reply_text(help_text, parse_mode="Markdown")
     
@@ -380,11 +384,17 @@ class MariLingoBot:
         gamification = session["gamification"]
         
         await update.message.chat.send_action("typing")
-        
+
+        # Инициализируем до try: переменная читается в except, а присваивалась
+        # только внутри try. Исключение из rag_searcher.search() давало
+        # UnboundLocalError прямо в обработчике ошибки — пользователь не получал
+        # вообще никакого ответа.
+        rag_context = NO_RAG_CONTEXT
+
         try:
             import io
             import contextlib
-            
+
             f = io.StringIO()
             with contextlib.redirect_stdout(f):
                 rag_results = rag_searcher.search(message, n_results=3)
@@ -397,8 +407,8 @@ class MariLingoBot:
                 ), 1):
                     context_parts.append(f"[Источник {i} - {metadata['filename']}]:\n{doc[:500]}")
             
-            rag_context = "\n\n".join(context_parts) if context_parts else "Контекст не найден в базе знаний."
-            
+            rag_context = "\n\n".join(context_parts) if context_parts else NO_RAG_CONTEXT
+
             system_prompt = """Ты - Mari Lingo Bot, помощник по изучению марийского языка.
 
 Используй предоставленный контекст из базы знаний для ответа на вопросы пользователя.
@@ -440,11 +450,14 @@ class MariLingoBot:
             
         except Exception as e:
             logger.error(f"Ошибка обработки сообщения: {e}")
-            
-            if rag_results and rag_results['documents'][0]:
-                fallback_response = "📚 **Информация из базы знаний:**\n\n"
+
+            if rag_context != NO_RAG_CONTEXT:
+                # Без parse_mode: сырой текст из базы знаний содержит * и _,
+                # на которых Telegram роняет запрос с "can't parse entities",
+                # и обработчик ошибки падал сам.
+                fallback_response = "📚 Информация из базы знаний:\n\n"
                 fallback_response += rag_context[:1000]
-                await update.message.reply_text(fallback_response, parse_mode="Markdown")
+                await update.message.reply_text(fallback_response)
             else:
                 await update.message.reply_text(
                     "Извини, произошла ошибка. Попробуй переформулировать вопрос! 🙏"
@@ -863,13 +876,19 @@ class MariLingoBot:
 Выберите правильный ответ:
 """
         
+        # В callback_data кладём только индекс: лимит Telegram — 64 байта, а
+        # кириллица занимает по 2 байта на символ. Вариант ответа длиннее ~27
+        # символов ронял отправку всего вопроса (BUTTON_DATA_INVALID), и юзер
+        # навсегда зависал на «⏳ Генерирую вопросы...». Текст ответа
+        # восстанавливается по индексу из самой сессии теста.
+        emojis = ['🅰️', '🅱️', '🅲', '🅳']
         keyboard = []
         for i, option in enumerate(question['options']):
-            emoji = ['🅰️', '🅱️', '🅲', '🅳'][i]
+            emoji = emojis[i] if i < len(emojis) else '▫️'
             keyboard.append([
                 InlineKeyboardButton(
-                    f"{emoji} {option}", 
-                    callback_data=f"answer_{i}_{option}"
+                    f"{emoji} {option}",
+                    callback_data=f"answer_{i}"
                 )
             ])
         
@@ -888,12 +907,22 @@ class MariLingoBot:
         if not quiz_session:
             await query.edit_message_text("Ошибка: сессия квиза не найдена")
             return
-        
-        parts = callback_data.split("_", 2)
-        if len(parts) < 3:
+
+        question = quiz_session.get_current_question()
+        if not question:
+            await self.finish_quiz(query, session)
             return
-        
-        user_answer = parts[2]
+
+        # callback_data — "answer_<индекс>"; split без maxsplit также корректно
+        # разбирает старый формат "answer_<индекс>_<текст>" из сообщений,
+        # отправленных до этого фикса.
+        try:
+            option_index = int(callback_data.split("_")[1])
+            user_answer = question["options"][option_index]
+        except (IndexError, ValueError):
+            logger.warning("Некорректный callback ответа: %s", callback_data)
+            return
+
         result = quiz_session.submit_answer(user_answer)
         
         if result['correct']:

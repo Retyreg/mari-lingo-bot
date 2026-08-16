@@ -1,0 +1,33 @@
+[Unit]
+Description=Mari Lingo Bot (Telegram, long polling)
+Documentation=https://github.com/Retyreg/mari-lingo-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/apps/mari-lingo-bot
+EnvironmentFile=/home/deploy/apps/mari-lingo-bot/.env
+ExecStart=/home/deploy/apps/mari-lingo-bot/venv/bin/python mari_lingo_bot_groq.py
+
+# Бот держит user_data/ и колоды карточек на диске — нужен только свой каталог.
+Restart=always
+RestartSec=10
+# Не долбиться в Telegram бесконечно, если сломан токен или кончился ключ:
+# больше 5 падений за 10 минут — юнит уходит в failed и ждёт человека.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# run_polling() закрывает сессию по SIGTERM сам; 15с хватает, дефолтные 90с
+# превращают systemctl restart в долгое ожидание.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mari-lingo-bot
+
+[Install]
+WantedBy=multi-user.target
